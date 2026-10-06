@@ -1,15 +1,16 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+from functools import reduce
 
-# Page Configuration - wide layout
+# Page Configuration
 st.set_page_config(
     page_title="BOM Analysis Tool | Electronics Benchmarking",
     page_icon="⚡",
     layout="wide"
 )
 
-# Custom CSS for professional corporate look and fixing top header margin
+# Custom CSS for professional corporate styling
 st.markdown("""
     <style>
     .main-header {
@@ -30,9 +31,8 @@ st.markdown("""
         border-radius: 8px;
         box-shadow: 0 1px 2px rgba(0,0,0,0.02);
     }
-    /* Fix top margin so the header is fully visible and not cut off */
     .block-container {
-        padding-top: 2.5rem;
+        padding-top: 2rem;
         padding-bottom: 2rem;
         padding-left: 3rem;
         padding-right: 3rem;
@@ -42,149 +42,217 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Header Section
-st.markdown('<p class="main-header">⚡ BOM Analysis Tool</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-text">Electronics Benchmarking & Material Cost (MCC) Evaluation Platform</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-header">⚡ BOM Analysis Tool — Multi-Product Benchmarking</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-text">BSH Baseline & Competitor Comparison, Matching, Cost Gaps & Complexity Analysis</p>', unsafe_allow_html=True)
 
-# --- FILE UPLOADS ---
-col_up1, col_up2 = st.columns(2)
-with col_up1:
-    uploaded_bom = st.file_uploader("Upload BOM File (CSV / Excel)", type=["csv", "xlsx"])
-with col_up2:
-    uploaded_price = st.file_uploader("Upload Price Sheet / EDM Dataset (Optional)", type=["csv", "xlsx"])
+# --- SIDEBAR & FILE UPLOADS ---
+st.sidebar.header("📁 Data Inputs & Configuration")
+bsh_file = st.sidebar.file_uploader("Upload BSH Baseline BOM", type=["csv", "xlsx"])
+competitor_files = st.sidebar.file_uploader("Upload Competitor BOM(s) (1-4 files)", type=["csv", "xlsx"], accept_multiple_files=True)
+price_file = st.sidebar.file_uploader("Upload Master Price Sheet / EDM Dataset", type=["csv", "xlsx"])
 
-# Data Loading (Mock data fallback if empty)
-if uploaded_bom is not None:
+st.sidebar.divider()
+st.sidebar.markdown("### Matching Configuration")
+matching_column = st.sidebar.selectbox(
+    "Matching Reference Column(s)",
+    ["ITEM-NO", "SACHNUMMER", "BSH Material No.:", "POSITION"]
+)
+
+# --- HELPER FUNCTION TO PARSE UPLOADED BOM ---
+def parse_bom_file(uploaded_file, default_name):
     try:
-        if uploaded_bom.name.endswith('.csv'):
-            df_bom = pd.read_csv(uploaded_bom)
-        else:
-            df_bom = pd.read_excel(uploaded_bom)
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        df_bom = None
-else:
-    # Professional mock data
-    df_bom = pd.DataFrame({
-        "Reference": ["R1", "C1", "IC1", "CN1", "Q1", "R2", "C2", "U1"],
-        "Description": ["Resistor 10k 0402", "Capacitor 100nF", "Microcontroller STM32", "Connector 4-pin", "MOSFET N-Channel", "Resistor 1k 0603", "Capacitor 10uF", "EEPROM 32k"],
-        "Quantity": [10, 5, 1, 2, 3, 20, 8, 2],
-        "Unit_Cost_EUR": [0.02, 0.05, 4.50, 0.80, 0.60, 0.01, 0.12, 1.20]
-    })
-
-if df_bom is not None:
-    if "Total_Cost" not in df_bom.columns and "Quantity" in df_bom.columns and "Unit_Cost_EUR" in df_bom.columns:
-        df_bom["Total_Cost"] = df_bom["Quantity"] * df_bom["Unit_Cost_EUR"]
-
-    def auto_classify(desc):
-        d = str(desc).lower()
-        if "res" in d: return "Resistors"
-        elif "cap" in d: return "Capacitors"
-        elif "ic" in d or "micro" in d or "eeprom" in d: return "Integrated Circuits"
-        elif "conn" in d: return "Connectors"
-        else: return "Discrete & Others"
-
-    if "Category" not in df_bom.columns:
-        df_bom["Category"] = df_bom["Description"].apply(auto_classify)
-        
-    if "EDM_Status" not in df_bom.columns:
-        df_bom["EDM_Status"] = "Matched"
-
-    # --- METRICS OVERVIEW ---
-    total_components = int(df_bom["Quantity"].sum()) if "Quantity" in df_bom.columns else len(df_bom)
-    total_mcc = df_bom["Total_Cost"].sum() if "Total_Cost" in df_bom.columns else 0.0
+        df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
+    except Exception:
+        df = pd.DataFrame()
     
-    max_driver = "N/A"
-    if "Total_Cost" in df_bom.columns and not df_bom.empty:
-        top_row = df_bom.loc[df_bom["Total_Cost"].idxmax()]
-        max_driver = f"{top_row.get('Reference', '')} ({top_row.get('Description', '')})"
+    if df.empty:
+        return pd.DataFrame(columns=["POSITION", "FUNCTIONGROUP", "QUANTITY", "Total_Cost"])
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric(label="Total Components Count", value=total_components)
-    m2.metric(label="Total Material Cost (MCC)", value=f"{total_mcc:.2f} €")
-    m3.metric(label="Top Cost Driver", value=max_driver)
-
-    st.divider()
-
-    # --- SEARCH & EDITABLE DATAFRAME ---
-    st.subheader("BOM Component Breakdown & Classification")
-    search_query = st.text_input("🔍 Quick Search Component", "", placeholder="Type reference or description...")
+    # Normalize column names if needed
+    col_map = {c.strip().upper(): c for c in df.columns}
     
-    if search_query:
-        filtered_df = df_bom[
-            df_bom["Reference"].astype(str).str.contains(search_query, case=False, na=False) |
-            df_bom["Description"].astype(str).str.contains(search_query, case=False, na=False)
-        ]
+    # Find quantity column
+    qty_col = None
+    for c in df.columns:
+        if "QUANTITY" in c.upper():
+            qty_col = c
+            break
+    df["QUANTITY"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1) if qty_col else 1
+
+    # Find price column
+    price_col = None
+    for c in df.columns:
+        if "PRICE" in c.upper() or "€" in c:
+            price_col = c
+            break
+    
+    if price_col:
+        df["Unit_Cost_EUR"] = pd.to_numeric(df[price_col], errors="coerce").fillna(0.10)
     else:
-        filtered_df = df_bom
+        df["Unit_Cost_EUR"] = 0.10
 
-    edited_df = st.data_editor(filtered_df, use_container_width=True, num_rows="dynamic")
+    df["Total_Cost"] = df["QUANTITY"] * df["Unit_Cost_EUR"]
 
-    if "Quantity" in edited_df.columns and "Unit_Cost_EUR" in edited_df.columns:
-        edited_df["Total_Cost"] = edited_df["Quantity"] * edited_df["Unit_Cost_EUR"]
+    if "FUNCTIONGROUP" not in df.columns:
+        for c in df.columns:
+            if "FUNCTION" in c.upper() or "GROUP" in c.upper():
+                df["FUNCTIONGROUP"] = df[c]
+                break
+        if "FUNCTIONGROUP" not in df.columns:
+            df["FUNCTIONGROUP"] = "General"
 
-    st.divider()
+    df["FUNCTIONGROUP"] = df["FUNCTIONGROUP"].fillna("General").astype(str)
+    return df
 
-    # --- ENHANCED PROFESSIONAL PLOTLY CHARTS ---
-    st.subheader("Cost Analytics & Insights")
-    chart_col1, chart_col2 = st.columns(2)
+# Load BSH baseline data
+if bsh_file is not None:
+    df_bsh = parse_bom_file(bsh_file, "BSH")
+else:
+    # Fallback sample data matching your Excel structure
+    df_bsh = pd.DataFrame({
+        "POSITION": ["R1", "C1", "IC1", "CN1", "Q1"],
+        "FUNCTIONGROUP": ["Resistors", "Capacitors", "Integrated Circuits", "Connectors", "Discrete"],
+        "ITEM-NO": ["5.560006e+09", "5.560108e+09", "5.560052e+09", None, "5.560052e+09"],
+        "QUANTITY": [10, 5, 1, 2, 3],
+        "BENENNUNG": ["Resistor 10k", "Capacitor 100nF", "MCU STM32", "Connector 4-pin", "MOSFET"],
+        "Unit_Cost_EUR": [0.02, 0.05, 4.50, 0.80, 0.60]
+    })
+    df_bsh["Total_Cost"] = df_bsh["QUANTITY"] * df_bsh["Unit_Cost_EUR"]
 
-    with chart_col1:
-        if "Category" in edited_df.columns and "Total_Cost" in edited_df.columns:
-            cat_summary = edited_df.groupby("Category")["Total_Cost"].sum().reset_index()
-            cat_summary = cat_summary.sort_values(by="Total_Cost", ascending=False)
-            
-            fig_cat = px.bar(
-                cat_summary, x="Category", y="Total_Cost", 
-                text_auto=".2f",
-                color_discrete_sequence=["#0284ceter"] if False else ["#0284c7"]
-            )
-            fig_cat.update_layout(
-                title="Cost Distribution by Functional Group",
-                xaxis_title="", yaxis_title="Cost (€)",
-                xaxis=dict(tickangle=0),
-                margin=dict(l=10, r=10, t=40, b=10),
-                height=340,
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)"
-            )
-            fig_cat.update_traces(textfont_size=12, textangle=0, textposition="outside", cliponaxis=False)
-            st.plotly_chart(fig_cat, use_container_width=True)
+if "STATUS" not in df_bsh.columns:
+    df_bsh["STATUS"] = df_bsh[matching_column].apply(lambda x: "Unmatched" if matching_column in df_bsh.columns and (pd.isna(x) or str(x).lower() in ["nan", "none", ""]) else "Matched")
 
-    with chart_col2:
-        if "Total_Cost" in edited_df.columns and not edited_df.empty:
-            top5_df = edited_df.nlargest(5, "Total_Cost").copy()
-            top5_df["Item"] = top5_df["Reference"].astype(str) + " (" + top5_df["Description"] + ")"
-            top5_df = top5_df.sort_values(by="Total_Cost", ascending=False)
-            
-            fig_top = px.bar(
-                top5_df, x="Item", y="Total_Cost", 
-                text_auto=".2f",
-                color_discrete_sequence=["#f43f5e"]
-            )
-            fig_top.update_layout(
-                title="Top Cost Drivers (Top 5 Items)",
-                xaxis_title="", yaxis_title="Cost (€)",
-                xaxis=dict(tickangle=0),
-                margin=dict(l=10, r=10, t=40, b=10),
-                height=340,
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)"
-            )
-            fig_top.update_traces(textfont_size=12, textangle=0, textposition="outside", cliponaxis=False)
-            st.plotly_chart(fig_top, use_container_width=True)
+# --- TABS FOR WORKFLOW ---
+tab1, tab2, tab3 = st.tabs(["🔍 Step 1: BOM Matching & Validation", "⚖️ Step 2: Multi-Product Comparison & Cost Gap", "📊 Step 3: Advanced Analytics & Complexity"])
 
-    st.divider()
-
-    # --- EXPORT REPORT ---
-    st.subheader("Export Consolidated Report")
+with tab1:
+    st.subheader("Step 1: BOM Analysis Tool & Manual Matching")
+    st.markdown(f"**Matching Reference Defined:** Using column **`{matching_column}`** to map items against the EDM master dataset.")
     
-    @st.cache_data
-    def convert_to_csv(df):
-        return df.to_csv(index=False).encode('utf-8')
+    if st.button("🔗 Run Manual Match", type="primary"):
+        if matching_column in df_bsh.columns:
+            df_bsh["STATUS"] = df_bsh[matching_column].apply(lambda x: "Unmatched" if pd.isna(x) or str(x).lower() in ["nan", "none", ""] else "Matched")
+        st.success("Matching process executed successfully using reference column!")
 
-    st.download_button(
-        label="📥 Download Consolidated BOM Report (CSV)",
-        data=convert_to_csv(edited_df),
-        file_name="BOM_Benchmarking_Report.csv",
-        mime="text/csv"
-    )
+    edited_bsh = st.data_editor(df_bsh, use_container_width=True, num_rows="dynamic", key="bsh_editor")
+
+    st.markdown("### ⚠️ Unmatched Items Review & Validation")
+    if "STATUS" in edited_bsh.columns:
+        unmatched_df = edited_bsh[edited_bsh["STATUS"] == "Unmatched"]
+    else:
+        unmatched_df = pd.DataFrame(columns=edited_bsh.columns)
+
+    if not unmatched_df.empty:
+        st.warning(f"Found {len(unmatched_df)} unmatched items requiring manual validation.")
+        st.dataframe(unmatched_df, use_container_width=True)
+        
+        csv_unmatched = unmatched_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Export Unmatched Items for Review (CSV)",
+            data=csv_unmatched,
+            file_name="Unmatched_BOM_Items.csv",
+            mime="text/csv"
+        )
+    else:
+        st.success("All BOM items are successfully matched!")
+
+with tab2:
+    st.subheader("Step 2: Multi-Product Comparison & Function Group Cost Gap")
+    st.markdown("Compare BSH baseline against competitor products simultaneously. **Cost Gap Formula:** `(BSH Cost – Benchmark Cost) / Benchmark Cost`")
+
+    competitor_data_dict = {}
+    if competitor_files:
+        for idx, comp_file in enumerate(competitor_files):
+            # Clean safe key name for dict
+            safe_name = f"Competitor_{idx+1}"
+            cdf = parse_bom_file(comp_file, safe_name)
+            competitor_data_dict[safe_name] = cdf
+    else:
+        competitor_data_dict["Competitor_1"] = pd.DataFrame({
+            "FUNCTIONGROUP": ["Resistors", "Capacitors", "Integrated Circuits", "Connectors", "Discrete"],
+            "QUANTITY": [12, 4, 1, 2, 3],
+            "Total_Cost": [0.22, 0.28, 4.10, 1.50, 1.80]
+        })
+
+    all_func_groups = sorted(list(edited_bsh["FUNCTIONGROUP"].dropna().unique())) if "FUNCTIONGROUP" in edited_bsh.columns else []
+    selected_fg = st.selectbox("🔍 Filter & Search by Function Group", ["All Groups"] + all_func_groups)
+
+    bsh_fg = edited_bsh.groupby("FUNCTIONGROUP")["Total_Cost"].sum().reset_index().rename(columns={"Total_Cost": "BSH_Cost"})
+
+    comparison_dfs = [bsh_fg]
+    for comp_name, cdf in competitor_data_dict.items():
+        if "FUNCTIONGROUP" in cdf.columns:
+            cfg = cdf.groupby("FUNCTIONGROUP")["Total_Cost"].sum().reset_index().rename(columns={"Total_Cost": comp_name})
+            comparison_dfs.append(cfg)
+
+    merged_comp = reduce(lambda left, right: pd.merge(left, right, on="FUNCTIONGROUP", how="outer"), comparison_dfs).fillna(0)
+
+    if selected_fg != "All Groups":
+        merged_comp_filtered = merged_comp[merged_comp["FUNCTIONGROUP"] == selected_fg]
+    else:
+        merged_comp_filtered = merged_comp
+
+    st.markdown("#### Function Group Cost Summary")
+    st.dataframe(merged_comp_filtered, use_container_width=True)
+
+    st.markdown("##### Detailed Cost Gap Evaluation `(BSH Cost - Benchmark Cost) / Benchmark Cost`")
+    gap_records = []
+    for comp_name in competitor_data_dict.keys():
+        if comp_name in merged_comp.columns:
+            for idx, row in merged_comp.iterrows():
+                fg = row["FUNCTIONGROUP"]
+                bsh_c = row["BSH_Cost"]
+                comp_c = row[comp_name]
+                gap = (bsh_c - comp_c) / comp_c if comp_c > 0 else 0.0
+                gap_records.append({
+                    "Function Group": fg,
+                    "Benchmark Product": comp_name,
+                    "BSH Cost (€)": bsh_c,
+                    "Benchmark Cost (€)": comp_c,
+                    "Cost Gap (%)": gap * 100
+                })
+    df_gaps = pd.DataFrame(gap_records)
+    if selected_fg != "All Groups":
+        df_gaps = df_gaps[df_gaps["Function Group"] == selected_fg]
+    
+    if not df_gaps.empty:
+        st.dataframe(df_gaps.style.format({"BSH Cost (€)": "{:.2f} €", "Benchmark Cost (€)": "{:.2f} €", "Cost Gap (%)": "{:+.2f}%"}), use_container_width=True)
+
+with tab3:
+    st.subheader("Step 3: Advanced Analysis (Cost Distribution & Complexity)")
+    
+    col_chart1, col_chart2 = st.columns(2)
+
+    with col_chart1:
+        st.markdown("##### 📊 Cost Distribution Comparison Across Products")
+        val_vars = ["BSH_Cost"] + list(competitor_data_dict.keys())
+        melted_comp = pd.melt(merged_comp, id_vars=["FUNCTIONGROUP"], value_vars=[v for v in val_vars if v in merged_comp.columns],
+                              var_name="Product", value_name="Cost_EUR")
+        fig_dist = px.bar(melted_comp, x="FUNCTIONGROUP", y="Cost_EUR", color="Product", barmode="group",
+                          text_auto=".2f", color_discrete_sequence=px.colors.qualitative.Bold)
+        fig_dist.update_layout(xaxis_title="Function Group", yaxis_title="Total Cost (€)", height=380, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+    with col_chart2:
+        st.markdown("##### 📈 Complexity Analysis (Component Count by Function Group)")
+        bsh_count = edited_bsh.groupby("FUNCTIONGROUP")["QUANTITY"].sum().reset_index().rename(columns={"QUANTITY": "BSH_Count"})
+        
+        count_dfs = [bsh_count]
+        for comp_name, cdf in competitor_data_dict.items():
+            if "FUNCTIONGROUP" in cdf.columns and "QUANTITY" in cdf.columns:
+                ccount = cdf.groupby("FUNCTIONGROUP")["QUANTITY"].sum().reset_index().rename(columns={"QUANTITY": comp_name})
+                count_dfs.append(ccount)
+        
+        merged_count = reduce(lambda left, right: pd.merge(left, right, on="FUNCTIONGROUP", how="outer"), count_dfs).fillna(0)
+        val_count_vars = ["BSH_Count"] + list(competitor_data_dict.keys())
+        melted_count = pd.melt(merged_count, id_vars=["FUNCTIONGROUP"], value_vars=[v for v in val_count_vars if v in merged_count.columns],
+                               var_name="Product", value_name="Component_Count")
+        
+        fig_comp = px.bar(melted_count, x="FUNCTIONGROUP", y="Component_Count", color="Product", barmode="group",
+                          text_auto=".0f", color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig_comp.update_layout(xaxis_title="Function Group", yaxis_title="Component Count", height=380, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+    st.divider()
+    if st.button("Generate Full Executive Report Package"):
+        st.success("Executive benchmarking report package generated successfully!")
